@@ -1,0 +1,40 @@
+[project]
+name = "nanogpt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Husain-Vora", email = "husain.vora.0192@gmail.com" }
+]
+requires-python = ">=3.12.14"
+dependencies = [
+    "datasets>=5.0.1",
+    "matplotlib>=3.11.1",
+    "tiktoken>=0.14.0",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+    "tqdm>=4.70.0",
+    "transformers>=5.16.1",
+    "wandb>=0.29.0",
+]
+
+[project.scripts]
+nanogpt = "nanogpt:main"
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+]
