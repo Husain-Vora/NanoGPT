@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import math
 
 # -------------------------------------------------------
 
@@ -29,7 +30,15 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # 
+
+        # att=(q @ k.transpose(-2,-1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, T) k (B, nh, T, hs) -> (B, nh, T, hs)
+
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -85,6 +94,23 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd)
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self.__init__weights)
+
+    def __init__weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
@@ -190,6 +216,8 @@ class DataloaderLite:
 
 # ---------------------------------------------------------------------------
 # attempt to autodetect the device
+import time
+
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
@@ -197,25 +225,41 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
    device = "mps"
 print(f"using device: {device}")
 
-train_loader = DataloaderLite(B=4, T=32)
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+# total_batch_size = 16 * 1024  # effective batch, same as before
+# B = 2          # micro batch, fits memory
+# T = 1024
+# grad_accum_steps = total_batch_size // (B * T)  # = 8
+# train_loader = DataloaderLite(B=B, T=T)
+
+train_loader = DataloaderLite(B=2, T=1024)
+
+torch.set_float32_matmul_precision('high')
 
 # get logits
-# model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig())
-# model.eval()
 model.to(device)
-# logits, loss = model(x, y)
+model = torch.compile(model)
 
 # optimzer!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {i}: loss {loss.item():.6f}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 # time difference in milliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1-t0)
+    print(f"step {i}: loss {loss.item():.6f}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
