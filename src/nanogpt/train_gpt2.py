@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from .hellaswag import render_example, iterate_examples
+from hellaswag import render_example, iterate_examples # pyright: ignore[reportMissingImports]
 
 # -------------------------------------------------------
 
@@ -324,7 +324,7 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding('gpt2')
 
-total_batch_size = 32768  # 2**19, ~0.5M in number of tokens
+total_batch_size = 32768  # 2**15, 32,768 in number of tokens
 B = 2          # micro batch, fits memory
 T = 1024       # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
@@ -373,10 +373,28 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 log_dir = "../log"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
-with open(log_file, 'w') as f: # open for writing to clear the file
-    pass
 
-for step in range(max_steps):
+checkpoint_dir = "../checkpoints"
+os.makedirs(checkpoint_dir, exist_ok=True)
+checkpoint_path = os.path.join(checkpoint_dir, "latest.pt")
+save_every = 500
+
+start_step = 0
+if os.path.exists(checkpoint_path):
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    raw_model.load_state_dict(ckpt['model'])
+    optimizer.load_state_dict(ckpt['optimizer'])
+    start_step = ckpt['step'] + 1
+    train_loader.current_shard = ckpt['shard']
+    train_loader.current_position = ckpt['position']
+    train_loader.tokens = load_tokens(train_loader.shards[train_loader.current_shard])
+    if master_process:
+        print(f"resumed from step {start_step}")
+else:
+    with open(log_file, 'w') as f: # only clear on fresh start
+        pass
+
+for step in range(start_step, max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
@@ -426,14 +444,14 @@ for step in range(max_steps):
             num_total = torch.tensor(num_total, dtype=torch.long, device=device)
             num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
             dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
-            dist.all_reduce(num_correct_norm, op=dist.Reduce0p.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
             num_total = num_total.item()
             num_correct_norm = num_correct_norm.item()
         acc_norm = num_correct_norm / num_total
         if master_process:
-            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm :. 4f}")
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm :.4f}")
             with open(log_file, "a") as f:
-                f.write(f"{step} hella {acc_norm :. 4f}\n")
+                f.write(f"{step} hella {acc_norm :.4f}\n")
 
 
     # Once in a while generate from model (except step 0, which is noise)
@@ -451,7 +469,8 @@ for step in range(max_steps):
         while xgen.size(1) < max_length:
             # forward the model to get the logits
             with torch.no_grad():
-                logits = model(xgen) # (B, T, vocab_size)
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
                 # get the probabilities
@@ -508,7 +527,14 @@ for step in range(max_steps):
         print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss_accum.item():.6f}\n")
+        if step % save_every == 0 or last_step:
+            torch.save({
+                'step': step,
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'shard': train_loader.current_shard,
+                'position': train_loader.current_position,
+            }, checkpoint_path)
 
 if ddp:
     destroy_process_group()
-
